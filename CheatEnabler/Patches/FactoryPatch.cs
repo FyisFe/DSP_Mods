@@ -1,7 +1,9 @@
-﻿using System;
+using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection.Emit;
+using System.Threading.Tasks;
 using BepInEx.Configuration;
 using CommonAPI.Systems;
 using HarmonyLib;
@@ -989,6 +991,18 @@ public class FactoryPatch : PatchImpl<FactoryPatch>
             }
         }
 
+        // Struct for flattened signal work items - avoids allocations
+        private struct SignalWorkItem
+        {
+            public int FactoryIndex;
+            public int BeltId;
+            public BeltSignal Signal;
+        }
+        
+        // Pre-allocated work buffer - grows as needed
+        private static SignalWorkItem[] _workItems = new SignalWorkItem[4096];
+        private static readonly ConcurrentBag<(int factoryIndex, int beltId)> _toRemove = new();
+
         public static void ProcessBeltSignals()
         {
             if (!_initialized) return;
@@ -996,56 +1010,98 @@ public class FactoryPatch : PatchImpl<FactoryPatch>
             var factories = data?.factories;
             if (factories == null) return;
             DeepProfiler.BeginSample(DPEntry.Belt);
-            for (var index = data.factoryCount - 1; index >= 0; index--)
+            
+            var factoryCount = data.factoryCount;
+            var countRecipe = BeltSignalCountRecipeEnabled.Value;
+            var countGen = BeltSignalCountGenEnabled.Value;
+            var countRem = BeltSignalCountRemEnabled.Value;
+            
+            // Phase 1: Collect all work items (single-threaded, fast)
+            var totalCount = 0;
+            for (var index = 0; index < factoryCount; index++)
             {
-                var factory = factories[index];
-                if (factory == null) continue;
+                var belts = GetSignalBelts(index);
+                if (belts != null) totalCount += belts.Count;
+            }
+            
+            if (totalCount == 0)
+            {
+                DeepProfiler.EndSample(DPEntry.Belt);
+                return;
+            }
+            
+            // Ensure buffer is large enough
+            if (_workItems.Length < totalCount)
+            {
+                _workItems = new SignalWorkItem[Math.Max(totalCount, _workItems.Length * 2)];
+            }
+            
+            var workIndex = 0;
+            for (var index = 0; index < factoryCount; index++)
+            {
                 var belts = GetSignalBelts(index);
                 if (belts == null || belts.Count == 0) continue;
-                var factoryProductionStat = GameMain.statistics.production.factoryStatPool[index];
-                var productRegister = factoryProductionStat.productRegister;
-                var consumeRegister = factoryProductionStat.consumeRegister;
-                var countRecipe = BeltSignalCountRecipeEnabled.Value;
-                var cargoTraffic = factory.cargoTraffic;
-                var beltCount = cargoTraffic.beltCursor;
-                List<int> beltsToRemove = null;
                 foreach (var pair in belts)
                 {
-                    if (pair.Key >= beltCount)
+                    _workItems[workIndex++] = new SignalWorkItem
                     {
-                        if (beltsToRemove == null)
-                            beltsToRemove = [pair.Key];
-                        else
-                            beltsToRemove.Add(pair.Key);
+                        FactoryIndex = index,
+                        BeltId = pair.Key,
+                        Signal = pair.Value
+                    };
+                }
+            }
+            
+            // Phase 2: Process all signals in parallel with Partitioner for better load balancing
+            var partitioner = Partitioner.Create(0, workIndex, Math.Max(1, workIndex / (Environment.ProcessorCount * 4)));
+            
+            Parallel.ForEach(partitioner, range =>
+            {
+                for (var i = range.Item1; i < range.Item2; i++)
+                {
+                    ref var workItem = ref _workItems[i];
+                    var factoryIndex = workItem.FactoryIndex;
+                    var beltId = workItem.BeltId;
+                    var beltSignal = workItem.Signal;
+                    
+                    var factory = factories[factoryIndex];
+                    var cargoTraffic = factory.cargoTraffic;
+                    var beltCount = cargoTraffic.beltCursor;
+                    
+                    if (beltId >= beltCount || beltId <= 0)
+                    {
+                        _toRemove.Add((factoryIndex, beltId));
                         continue;
                     }
-                    var beltSignal = pair.Value;
+                    
+                    ref var belt = ref cargoTraffic.beltPool[beltId];
+                    if (belt.id != beltId) continue;
+                    
+                    var factoryProductionStat = GameMain.statistics.production.factoryStatPool[factoryIndex];
+                    var productRegister = factoryProductionStat.productRegister;
+                    var consumeRegister = factoryProductionStat.consumeRegister;
+                    
                     var signalId = beltSignal.SignalId;
                     switch (signalId)
                     {
                         case 404:
                             {
-                                var beltId = pair.Key;
-                                ref var belt = ref cargoTraffic.beltPool[beltId];
                                 var cargoPath = cargoTraffic.GetCargoPath(belt.segPathId);
                                 if (cargoPath == null) continue;
                                 int itemId;
                                 if ((itemId = cargoPath.TryPickItem(belt.segIndex + belt.segPivotOffset - 5, 12, out var stack, out _)) > 0)
                                 {
-                                    if (BeltSignalCountRemEnabled.Value) consumeRegister[itemId] += stack;
+                                    if (countRem) System.Threading.Interlocked.Add(ref consumeRegister[itemId], stack);
                                 }
-
-                                continue;
+                                break;
                             }
                         case 600:
                             {
-                                if (!_portalTo.TryGetValue(beltSignal.SpeedLimit, out var set)) continue;
-                                var beltId = pair.Key;
-                                ref var belt = ref cargoTraffic.beltPool[beltId];
+                                if (!_portalTo.TryGetValue(beltSignal.SpeedLimit, out var set)) break;
                                 var cargoPath = cargoTraffic.GetCargoPath(belt.segPathId);
-                                if (cargoPath == null) continue;
+                                if (cargoPath == null) break;
                                 var segIndex = belt.segIndex + belt.segPivotOffset;
-                                if (!cargoPath.GetCargoAtIndex(segIndex, out var cargo, out var cargoId, out var _)) break;
+                                if (!cargoPath.GetCargoAtIndex(segIndex, out var cargo, out var cargoId, out _)) break;
                                 var itemId = cargo.item;
                                 var cargoPool = cargoPath.cargoContainer.cargoPool;
                                 var inc = cargoPool[cargoId].inc;
@@ -1054,73 +1110,64 @@ public class FactoryPatch : PatchImpl<FactoryPatch>
                                 {
                                     var cargoTraffic1 = factories[(int)(n >> 32)].cargoTraffic;
                                     ref var belt1 = ref cargoTraffic1.beltPool[(int)(n & 0x7FFFFFFF)];
-                                    cargoPath = cargoTraffic1.GetCargoPath(belt1.segPathId);
-                                    if (cargoPath == null) continue;
-                                    if (!cargoPath.TryInsertItem(belt1.segIndex + belt1.segPivotOffset, itemId, stack, inc)) continue;
+                                    var cargoPath1 = cargoTraffic1.GetCargoPath(belt1.segPathId);
+                                    if (cargoPath1 == null) continue;
+                                    if (!cargoPath1.TryInsertItem(belt1.segIndex + belt1.segPivotOffset, itemId, stack, inc)) continue;
                                     cargoPath.TryPickItem(segIndex - 5, 12, out var stack1, out var inc1);
                                     if (inc1 != inc || stack1 != stack)
                                         cargoPath.TryPickItem(segIndex - 5, 12, out _, out _);
                                     break;
                                 }
-
-                                continue;
+                                break;
                             }
                         case >= 1000 and < 20000:
                             {
                                 var hasSpeedLimit = beltSignal.SpeedLimit > 0;
                                 if (hasSpeedLimit)
                                 {
-                                    beltSignal.Progress += beltSignal.SpeedLimit;
-                                    switch (beltSignal.Progress)
-                                    {
-                                        case < 3600:
-                                            continue;
-                                        case > 18000:
-                                            beltSignal.Progress = 14400;
-                                            break;
-                                    }
+                                    var progress = System.Threading.Interlocked.Add(ref beltSignal.Progress, beltSignal.SpeedLimit);
+                                    if (progress < 3600) break;
+                                    if (progress > 18000) beltSignal.Progress = 14400;
                                 }
 
-                                var beltId = pair.Key;
-                                ref var belt = ref cargoTraffic.beltPool[beltId];
                                 var cargoPath = cargoTraffic.GetCargoPath(belt.segPathId);
-                                if (cargoPath == null) continue;
+                                if (cargoPath == null) break;
                                 var stack = beltSignal.Stack;
                                 var inc = beltSignal.Inc;
-                                if (!cargoPath.TryInsertItem(belt.segIndex + belt.segPivotOffset, signalId, stack, inc)) continue;
-                                if (hasSpeedLimit) beltSignal.Progress -= 3600;
-                                if (BeltSignalCountGenEnabled.Value) productRegister[signalId] += stack;
-                                if (!countRecipe) continue;
+                                if (!cargoPath.TryInsertItem(belt.segIndex + belt.segPivotOffset, signalId, stack, inc)) break;
+                                if (hasSpeedLimit) System.Threading.Interlocked.Add(ref beltSignal.Progress, -3600);
+                                if (countGen) System.Threading.Interlocked.Add(ref productRegister[signalId], stack);
+                                if (!countRecipe) break;
                                 var sources = beltSignal.Sources;
-                                if (sources == null) continue;
-                                var progress = beltSignal.SourceProgress;
+                                if (sources == null) break;
+                                var sourceProgress = beltSignal.SourceProgress;
                                 var stackf = (float)stack;
-                                for (var i = sources.Length - 1; i >= 0; i--)
+                                for (var j = sources.Length - 1; j >= 0; j--)
                                 {
-                                    var newCnt = progress[i] + sources[i].Item2 * stackf;
+                                    var newCnt = sourceProgress[j] + sources[j].Item2 * stackf;
                                     if (newCnt > 0)
                                     {
-                                        var itemId = sources[i].Item1;
+                                        var srcItemId = sources[j].Item1;
                                         var cnt = Mathf.CeilToInt(newCnt);
-                                        productRegister[itemId] += cnt;
-                                        consumeRegister[itemId] += cnt;
-                                        progress[i] = newCnt - cnt;
+                                        System.Threading.Interlocked.Add(ref productRegister[srcItemId], cnt);
+                                        System.Threading.Interlocked.Add(ref consumeRegister[srcItemId], cnt);
+                                        sourceProgress[j] = newCnt - cnt;
                                     }
                                     else
                                     {
-                                        progress[i] = newCnt;
+                                        sourceProgress[j] = newCnt;
                                     }
                                 }
-
-                                continue;
+                                break;
                             }
                     }
                 }
-                if (beltsToRemove == null) continue;
-                foreach (var beltId in beltsToRemove)
-                {
-                    belts.Remove(beltId);
-                }
+            });
+            
+            // Phase 3: Cleanup removed belts (single-threaded)
+            while (_toRemove.TryTake(out var item))
+            {
+                GetSignalBelts(item.factoryIndex)?.Remove(item.beltId);
             }
 
             DeepProfiler.EndSample(DPEntry.Belt);

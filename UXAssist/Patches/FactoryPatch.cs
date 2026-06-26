@@ -30,6 +30,7 @@ public class FactoryPatch : PatchImpl<FactoryPatch>
     public static ConfigEntry<bool> QuickBuildAndDismantleLabsEnabled;
     public static ConfigEntry<bool> ProtectVeinsFromExhaustionEnabled;
     public static ConfigEntry<bool> DoNotRenderEntitiesEnabled;
+    public static ConfigEntry<bool> DoNotRenderEntitiesHideSortersEnabled;
     public static ConfigEntry<bool> DragBuildPowerPolesEnabled;
     public static ConfigEntry<bool> DragBuildPowerPolesAlternatelyEnabled;
     public static ConfigEntry<bool> AutoConstructButtonEnabled;
@@ -123,6 +124,7 @@ public class FactoryPatch : PatchImpl<FactoryPatch>
         QuickBuildAndDismantleLabsEnabled.SettingChanged += (_, _) => QuickBuildAndDismantleLab.Enable(QuickBuildAndDismantleLabsEnabled.Value);
         ProtectVeinsFromExhaustionEnabled.SettingChanged += (_, _) => ProtectVeinsFromExhaustion.Enable(ProtectVeinsFromExhaustionEnabled.Value);
         DoNotRenderEntitiesEnabled.SettingChanged += (_, _) => DoNotRenderEntities.Enable(DoNotRenderEntitiesEnabled.Value);
+        DoNotRenderEntitiesHideSortersEnabled.SettingChanged += (_, _) => DoNotRenderEntities.HideSorters = DoNotRenderEntitiesHideSortersEnabled.Value;
         DragBuildPowerPolesEnabled.SettingChanged += (_, _) => DragBuildPowerPoles.Enable(DragBuildPowerPolesEnabled.Value);
         DragBuildPowerPolesAlternatelyEnabled.SettingChanged += (_, _) => DragBuildPowerPoles.AlternatelyChanged();
         AutoConstructButtonEnabled.SettingChanged += (_, _) => AutoConstructButton.Enable(AutoConstructButtonEnabled.Value);
@@ -155,6 +157,7 @@ public class FactoryPatch : PatchImpl<FactoryPatch>
         QuickBuildAndDismantleLab.Enable(QuickBuildAndDismantleLabsEnabled.Value);
         ProtectVeinsFromExhaustion.Enable(ProtectVeinsFromExhaustionEnabled.Value);
         DoNotRenderEntities.Enable(DoNotRenderEntitiesEnabled.Value);
+        DoNotRenderEntities.HideSorters = DoNotRenderEntitiesHideSortersEnabled.Value;
         DragBuildPowerPoles.Enable(DragBuildPowerPolesEnabled.Value);
         AutoConstructButton.Enable(AutoConstructButtonEnabled.Value);
         BeltSignalsForBuyOut.Enable(BeltSignalsForBuyOutEnabled.Value);
@@ -1436,12 +1439,21 @@ public class FactoryPatch : PatchImpl<FactoryPatch>
 
     private class DoNotRenderEntities : PatchImpl<DoNotRenderEntities>
     {
+        public static bool HideSorters;
+
         [HarmonyPrefix]
         [HarmonyPatch(typeof(ObjectRenderer), nameof(ObjectRenderer.Render))]
         [HarmonyPatch(typeof(DynamicRenderer), nameof(DynamicRenderer.Render))]
         private static bool ObjectRenderer_Render_Prefix()
         {
             return false;
+        }
+
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(InserterRenderer), nameof(InserterRenderer.Render))]
+        private static bool InserterRenderer_Render_Prefix()
+        {
+            return !HideSorters;
         }
 
         [HarmonyPrefix]

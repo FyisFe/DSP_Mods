@@ -70,6 +70,7 @@ public static class UIConfigWindow
             "By default, the vein amount is protected at 100, and oil speed is protected at 1.0/s, you can set them yourself in config file.\nWhen reach the protection value, veins/oils steeps will not be mined/extracted any longer.\nClose this function to resume mining and pumping, usually when you have enough level on `Veins Utilization`",
             "默认矿脉数量保护于剩余100，采油速保护于速度1.0/s，你可以在配置文件中自行设置。\n当达到保护值时，矿脉和油井将不再被开采。\n关闭此功能以恢复开采，一般是当你在`矿物利用`上有足够的等级时。\n");
         I18N.Add("Do not render factory entities", "Do not render factory entities (except belts and sorters)", "不渲染工厂建筑实体(除了传送带和分拣器)");
+        I18N.Add("Hide sorters too", "Hide sorters too", "同时隐藏分拣器");
         I18N.Add("Drag building power poles in maximum connection range", "Drag building power poles in maximum connection range", "拖动建造电线杆时自动使用最大连接距离间隔");
         I18N.Add("Build Tesla Tower and Wireless Power Tower alternately", "Build Tesla Tower and Wireless Power Tower alternately", "交替建造电力感应塔和无线输电塔");
         I18N.Add("Auto-construct button", "Auto-construct button", "自动建造按钮");
@@ -396,7 +397,19 @@ public static class UIConfigWindow
 
         x = 0;
         y += 36f;
-        wnd.AddCheckBox(x, y, tab2, FactoryPatch.DoNotRenderEntitiesEnabled, "Do not render factory entities");
+        {
+            wnd.AddCheckBox(x, y, tab2, FactoryPatch.DoNotRenderEntitiesEnabled, "Do not render factory entities");
+            y += 27f;
+            var hideSortersCheckBox = wnd.AddCheckBox(x + 20f, y, tab2, FactoryPatch.DoNotRenderEntitiesHideSortersEnabled, "Hide sorters too", 13);
+            FactoryPatch.DoNotRenderEntitiesEnabled.SettingChanged += DoNotRenderEntitiesEnabledChanged;
+            wnd.OnFree += () => { FactoryPatch.DoNotRenderEntitiesEnabled.SettingChanged -= DoNotRenderEntitiesEnabledChanged; };
+            DoNotRenderEntitiesEnabledChanged(null, null);
+
+            void DoNotRenderEntitiesEnabledChanged(object o, EventArgs e)
+            {
+                hideSortersCheckBox.SetEnable(FactoryPatch.DoNotRenderEntitiesEnabled.Value);
+            }
+        }
         y += 36f;
         checkBoxForMeasureTextWidth = wnd.AddCheckBox(x, y, tab2, FactoryPatch.ShortcutKeysForBlueprintCopyEnabled, "Shortcut keys for Blueprint Copy mode");
         wnd.AddTipsButton2(x + checkBoxForMeasureTextWidth.Width + 5f, y + 6f, tab2, "Shortcut keys for Blueprint Copy mode", "Shortcut keys for Blueprint Copy mode tips", "shortcut-keys-for-blueprint-copy-mode-tips");
